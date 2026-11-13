@@ -14,3 +14,6 @@ dependencies = []
 
 [project.scripts]
 myhp = "myhp.cli:main"
+
+[tool.setuptools.package-data]
+myhp = ["data/app_templates/*"]

@@ -125,6 +125,8 @@ def build_file_payload(
     name: str,
     content: Union[str, bytes],
     file_type: int | PrimeFileType = PrimeFileType.PRGM,
+    *,
+    raw_content: bool = False,
 ) -> bytes:
     """Build a complete HP Prime virtual packet for CMD_FILE (0xF7).
     
@@ -137,7 +139,7 @@ def build_file_payload(
     - Bytes 10..10+namelen: Name encoded in UTF-16LE
     - Bytes 10+namelen..end: Body encoded in UTF-16LE
     """
-    encoded_body = prepare_file_content(content)
+    encoded_body = bytes(content) if raw_content and isinstance(content, bytes) else prepare_file_content(content)
     encoded_name = name.encode("utf-16le")
 
     if len(encoded_name) > 255:

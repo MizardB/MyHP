@@ -5,9 +5,12 @@ from __future__ import annotations
 import glob
 import os
 import select
+import struct
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Optional
 
+from myhp.apps import read_hpprgm_source
 from myhp.formats import PrimeFileType, build_file_payload
 from myhp.protocol import (
     PrimeCatalogEntry,
@@ -216,6 +219,81 @@ class PrimeDevice:
             pass
 
         return len(chunks)
+
+    def send_app(self, name: str, app_directory: str) -> int:
+        """Install an app by sending its three catalog objects over CMD_FILE."""
+        if self._fd is None:
+            raise RuntimeError("Device not open")
+        report_size = self._output_report_size()
+        if report_size != 64:
+            raise NotImplementedError(
+                f"La instalación de apps aún no está implementada para reportes HID de {report_size} bytes"
+            )
+
+        folder = Path(app_directory)
+        app_file = (folder / f"{name}.hpapp").read_bytes()
+        note_file = (folder / f"{name}.hpappnote").read_bytes()
+        program_file = (folder / f"{name}.hpappprgm").read_bytes()
+        program_source = read_hpprgm_source(program_file)
+        transfers = (
+            (PrimeFileType.APP, app_file, True),
+            (PrimeFileType.APPNOTE, note_file, True),
+            (PrimeFileType.APPPRGM, program_source.encode("utf-16le"), True),
+        )
+        reports = 0
+        for file_type, content, raw in transfers:
+            packet = build_file_payload(name, content, file_type=file_type, raw_content=raw)
+            chunks = chunk_payload(packet)
+            for chunk in chunks:
+                self.send_raw(chunk)
+            reports += len(chunks)
+            try:
+                self.check_ready()
+            except Exception:
+                pass
+        return reports
+
+    def _output_report_size(self) -> int:
+        """Read the output report size from this hidraw node's HID descriptor."""
+        descriptor_path = os.path.join(
+            "/sys/class/hidraw", os.path.basename(self.hidraw_path), "device", "report_descriptor"
+        )
+        try:
+            with open(descriptor_path, "rb") as descriptor_file:
+                descriptor = descriptor_file.read()
+        except OSError as exc:
+            raise RuntimeError(f"No se pudo leer el descriptor HID {descriptor_path}: {exc}") from exc
+
+        report_size = 0
+        report_count = 0
+        offset = 0
+        while offset < len(descriptor):
+            prefix = descriptor[offset]
+            offset += 1
+            if prefix == 0xFE:  # Long item; skip its declared payload.
+                if offset + 2 > len(descriptor):
+                    break
+                length = descriptor[offset]
+                offset += 2 + length
+                continue
+            item_size = (0, 1, 2, 4)[prefix & 0x03]
+            item_type = (prefix >> 2) & 0x03
+            item_tag = (prefix >> 4) & 0x0F
+            raw = descriptor[offset : offset + item_size]
+            if len(raw) != item_size:
+                break
+            value = int.from_bytes(raw, "little")
+            offset += item_size
+            if item_type == 1:  # Global item.
+                if item_tag == 7:
+                    report_size = value
+                elif item_tag == 9:
+                    report_count = value
+            elif item_type == 0 and item_tag == 9:  # Output main item.
+                bits = report_size * report_count
+                if bits and bits % 8 == 0:
+                    return bits // 8
+        raise RuntimeError(f"No se encontró el tamaño del reporte HID de salida en {descriptor_path}")
 
     def list_content(self, timeout_s: float = 0.5) -> list[PrimeCatalogEntry]:
         """Query memory catalog from the HP Prime using CMD_RECV_BACKUP (0xF9).

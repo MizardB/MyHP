@@ -7,7 +7,9 @@ import os
 import sys
 from pathlib import Path
 
+from myhp.apps import build_app_directory
 from myhp.formats import PrimeFileType, sanitize_note_name, sanitize_program_name
+from myhp.images import png_icon, png_to_ppl
 from myhp.usb import PrimeDevice, find_prime_devices
 
 
@@ -97,6 +99,66 @@ def cmd_send_prgm(args: argparse.Namespace) -> int:
         print(f"Error al enviar el programa: {e}", file=sys.stderr)
         return 3
 
+    return 0
+
+
+def cmd_send_image(args: argparse.Namespace) -> int:
+    """Convert a PNG to a PPL image viewer and send it as a program."""
+    file_path = Path(args.file)
+    if not file_path.is_file():
+        print(f"Error: No existe el archivo '{args.file}'.", file=sys.stderr)
+        return 1
+    try:
+        image_data = file_path.read_bytes()
+        requested_name = args.name if args.name else file_path.stem
+        safe_name = sanitize_program_name(requested_name).upper()
+        if args.app:
+            content = png_to_ppl(image_data, safe_name, args.width, args.height, entrypoint="START")
+            icon = png_icon(image_data)
+            output_dir = Path(args.output) if args.output else file_path.parent
+            app_directory = build_app_directory(safe_name, content, icon, output_dir)
+        else:
+            content = png_to_ppl(image_data, safe_name, args.width, args.height)
+    except (OSError, ValueError) as e:
+        print(f"Error al convertir la imagen: {e}", file=sys.stderr)
+        return 1
+
+    prime = _get_target_device(args.device)
+    if not prime:
+        return 1
+    try:
+        with prime:
+            if args.app:
+                chunks = prime.send_app(safe_name, str(app_directory))
+                installed = any(
+                    item.file_type == PrimeFileType.APP and item.name.lstrip("&").lower() == safe_name.lower()
+                    for item in prime.list_content()
+                )
+                if not installed:
+                    print(
+                        f"El paquete de '{safe_name}' se transmitió ({chunks} paquetes HID), "
+                        "pero no aparece en el catálogo Apps.",
+                        file=sys.stderr,
+                    )
+                    print(f"Paquete local preparado: {app_directory}", file=sys.stderr)
+                    return 3
+                print(f"Aplicación '{safe_name}' instalada desde {file_path.name} en "
+                      f"{prime.hidraw_path} ({chunks} paquetes HID).")
+                print(f"En la calculadora: abre Apps y selecciona {safe_name}.")
+                print(f"Paquete local: {app_directory}")
+            else:
+                chunks = prime.send_file(safe_name, content, file_type=PrimeFileType.PRGM)
+                print(
+                    f"Visor PPL '{safe_name}' creado desde {file_path.name} y enviado a "
+                    f"{prime.hidraw_path} ({chunks} paquetes HID)."
+                )
+                print(f"En la calculadora: abre Programas y ejecuta {safe_name}().")
+    except PermissionError:
+        print(f"Error: Permiso denegado al abrir {prime.hidraw_path}.", file=sys.stderr)
+        return 2
+    except Exception as e:
+        print(f"Error al enviar el visor de imagen: {e}", file=sys.stderr)
+        return 3
     return 0
 
 
@@ -283,6 +345,16 @@ def main(argv: list[str] | None = None) -> int:
     prgm_parser.add_argument("file", help="Ruta al archivo (.hpprgm, .py o .txt)")
     prgm_parser.add_argument("-n", "--name", help="Nombre del programa en la calculadora (opcional)", default=None)
     prgm_parser.set_defaults(func=cmd_send_prgm)
+
+    # Command: send image (PNG converted to a PPL viewer)
+    image_parser = send_subparsers.add_parser("image", help="Convierte un PNG en visor PPL o aplicación y lo envía")
+    image_parser.add_argument("file", help="Ruta a la imagen PNG")
+    image_parser.add_argument("-n", "--name", help="Nombre del programa (opcional)", default=None)
+    image_parser.add_argument("--width", type=int, default=160, help="Ancho máximo en píxeles (1–320)")
+    image_parser.add_argument("--height", type=int, default=120, help="Alto máximo en píxeles (1–240)")
+    image_parser.add_argument("--app", action="store_true", help="Instala el visor como aplicación en Apps")
+    image_parser.add_argument("--output", help="Carpeta donde guardar el paquete .hpappdir (opcional)")
+    image_parser.set_defaults(func=cmd_send_image)
 
     # Command: list
     list_parser = subparsers.add_parser("list", help="Lista objetos almacenados en la memoria de la calculadora")
