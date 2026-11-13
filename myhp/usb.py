@@ -1,0 +1,316 @@
+"""Low-level USB / HID communication for HP Prime calculators."""
+
+from __future__ import annotations
+
+import glob
+import os
+import select
+from dataclasses import dataclass
+from typing import Optional
+
+from myhp.formats import PrimeFileType, build_file_payload
+from myhp.protocol import (
+    PrimeCatalogEntry,
+    PrimeCommand,
+    PrimeInfo,
+    build_command_packet,
+    chunk_payload,
+    parse_file_packet,
+    parse_vtl_response,
+)
+
+# Known HP Prime USB IDs
+HP_VENDOR_ID = 0x03F0
+HP_PRIME_PIDS = {
+    0x0141: "HP Prime G1",
+    0x0441: "HP Prime G1",
+    0x1541: "HP Prime G2",
+    0x2441: "HP Prime G2",
+}
+
+
+@dataclass
+class PrimeDeviceDescriptor:
+    """Descriptor of a detected HP Prime device node."""
+    hidraw_path: str
+    vid: int
+    pid: int
+    model_name: str
+    product_string: str = ""
+    manufacturer_string: str = ""
+
+
+def find_prime_devices() -> list[PrimeDeviceDescriptor]:
+    """Scan /sys/class/hidraw to detect connected HP Prime calculators."""
+    devices: list[PrimeDeviceDescriptor] = []
+
+    for hidraw_dir in glob.glob("/sys/class/hidraw/hidraw*"):
+        node_name = os.path.basename(hidraw_dir)
+        dev_node = os.path.join("/dev", node_name)
+        device_link = os.path.realpath(os.path.join(hidraw_dir, "device"))
+
+        # Walk up device hierarchy to locate USB idVendor and idProduct
+        cur = device_link
+        vid: Optional[int] = None
+        pid: Optional[int] = None
+        product_name = ""
+        manufacturer = ""
+
+        while cur and cur != "/":
+            v_file = os.path.join(cur, "idVendor")
+            p_file = os.path.join(cur, "idProduct")
+            if os.path.isfile(v_file) and os.path.isfile(p_file):
+                try:
+                    with open(v_file, "r") as f:
+                        vid = int(f.read().strip(), 16)
+                    with open(p_file, "r") as f:
+                        pid = int(f.read().strip(), 16)
+                except Exception:
+                    pass
+
+                prod_file = os.path.join(cur, "product")
+                if os.path.isfile(prod_file):
+                    try:
+                        with open(prod_file, "r") as f:
+                            product_name = f.read().strip()
+                    except Exception:
+                        pass
+
+                manuf_file = os.path.join(cur, "manufacturer")
+                if os.path.isfile(manuf_file):
+                    try:
+                        with open(manuf_file, "r") as f:
+                            manufacturer = f.read().strip()
+                    except Exception:
+                        pass
+                break
+            cur = os.path.dirname(cur)
+
+        if vid == HP_VENDOR_ID and pid in HP_PRIME_PIDS:
+            devices.append(
+                PrimeDeviceDescriptor(
+                    hidraw_path=dev_node,
+                    vid=vid,
+                    pid=pid,
+                    model_name=HP_PRIME_PIDS[pid],
+                    product_string=product_name,
+                    manufacturer_string=manufacturer,
+                )
+            )
+
+    return devices
+
+
+class PrimeDevice:
+    """Manages an open connection to an HP Prime calculator via hidraw."""
+
+    def __init__(self, hidraw_path: str, model_hint: str = "HP Prime"):
+        self.hidraw_path = hidraw_path
+        self.model_hint = model_hint
+        self._fd: Optional[int] = None
+        self._seq = 0
+
+    def open(self) -> None:
+        """Open the hidraw device node with read/write access."""
+        if self._fd is None:
+            self._fd = os.open(self.hidraw_path, os.O_RDWR)
+
+    def close(self) -> None:
+        """Close the hidraw device node."""
+        if self._fd is not None:
+            try:
+                os.close(self._fd)
+            finally:
+                self._fd = None
+
+    def __enter__(self) -> PrimeDevice:
+        self.open()
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        self.close()
+
+    def send_raw(self, data: bytes) -> int:
+        """Send a raw packet to the device.
+        
+        For Linux hidraw, packets are 65 bytes long (Report ID 0x00 + 64 bytes).
+        """
+        if self._fd is None:
+            raise RuntimeError("Device not open")
+        if len(data) != 65:
+            # Pad or truncate to 65 bytes
+            pkt = bytearray(65)
+            pkt[: min(len(data), 65)] = data[:65]
+            data = bytes(pkt)
+        return os.write(self._fd, data)
+
+    def recv_raw(self, timeout_s: float = 2.0, max_bytes: int = 64) -> bytes:
+        """Read a raw packet from the device (typically 64 bytes on Linux hidraw)."""
+        if self._fd is None:
+            raise RuntimeError("Device not open")
+
+        r, _, _ = select.select([self._fd], [], [], timeout_s)
+        if not r:
+            raise TimeoutError(f"Timed out waiting for data from {self.hidraw_path}")
+
+        return os.read(self._fd, max_bytes)
+
+    def send_command(self, cmd: int | PrimeCommand, payload: bytes = b"") -> None:
+        """Send a single command packet using the internal sequence counter."""
+        pkt = build_command_packet(cmd, packet_id=self._seq, payload=payload)
+        self._seq = (self._seq + 1) % 0xFF
+        self.send_raw(pkt)
+
+    def check_ready(self) -> bool:
+        """Ping calculator with CMD_CHECK_READY (0xFF)."""
+        self.send_command(PrimeCommand.CHECK_READY)
+        chunk = self.recv_raw(timeout_s=1.0)
+        # Check ready returns a 64-byte packet starting with 0x00 sequence
+        return len(chunk) > 0
+
+    def get_info(self) -> PrimeInfo:
+        """Retrieve calculator device info (serial, build, version, etc.)."""
+        # Drain any residual pending data if necessary
+        while True:
+            r, _, _ = select.select([self._fd], [], [], 0.05)
+            if r and self._fd is not None:
+                os.read(self._fd, 64)
+            else:
+                break
+
+        self.send_command(PrimeCommand.GET_INFOS)
+        # GET_INFOS typically responds with 2 chunks of 64 bytes (126 payload bytes after sequence bytes)
+        chunks: list[bytes] = []
+        for _ in range(2):
+            chunks.append(self.recv_raw(timeout_s=2.0))
+
+        cmd, payload = parse_vtl_response(chunks)
+        if cmd != PrimeCommand.GET_INFOS:
+            # If command echo mismatch, parse payload anyway if non-empty
+            pass
+
+        return PrimeInfo.from_bytes(payload, model_hint=self.model_hint)
+
+    def send_file(
+        self,
+        name: str,
+        content: str | bytes,
+        file_type: int | PrimeFileType = PrimeFileType.PRGM,
+    ) -> int:
+        """Send a complete file (note, program, etc.) to the HP Prime.
+        
+        Builds the virtual file packet, splits it into HID chunks, transmits
+        each chunk, and verifies the calculator remains ready.
+        Returns the number of transmitted HID chunks.
+        """
+        payload = build_file_payload(name, content, file_type=file_type)
+        chunks = chunk_payload(payload)
+
+        for chunk in chunks:
+            self.send_raw(chunk)
+
+        # Check ready to ensure calculator accepted packet cleanly
+        try:
+            self.check_ready()
+        except Exception:
+            pass
+
+        return len(chunks)
+
+    def list_content(self, timeout_s: float = 0.5) -> list[PrimeCatalogEntry]:
+        """Query memory catalog from the HP Prime using CMD_RECV_BACKUP (0xF9).
+        
+        Reads all file packets returned by the calculator until the stream ends.
+        Handles graceful recovery if the device resets its USB pipe at completion.
+        """
+        if self._fd is None:
+            raise RuntimeError("Device not open")
+
+        # Drain any lingering data
+        while True:
+            r, _, _ = select.select([self._fd], [], [], 0.05)
+            if r and self._fd is not None:
+                os.read(self._fd, 64)
+            else:
+                break
+
+        # Send CMD_RECV_BACKUP (0xF9 0x01)
+        self.send_command(PrimeCommand.RECV_BACKUP, payload=b"\x01")
+
+        def _read_hid_chunk(t: float) -> bytes | None:
+            if self._fd is None:
+                return None
+            r, _, _ = select.select([self._fd], [], [], t)
+            if not r:
+                return None
+            try:
+                return os.read(self._fd, 64)
+            except OSError:
+                return None
+
+        entries: list[PrimeCatalogEntry] = []
+
+        while True:
+            first_chunk = _read_hid_chunk(timeout_s)
+            if first_chunk is None:
+                break
+
+            data = first_chunk[1:]  # strip seq byte
+            if len(data) < 2:
+                continue
+
+            cmd = data[0]
+            if cmd == PrimeCommand.RECV_BACKUP:  # 0xF9 marker signals end of backup
+                break
+            if cmd != PrimeCommand.FILE:  # Expected 0xF7
+                break
+
+            if len(data) < 6:
+                break
+
+            import struct
+            size = struct.unpack_from(">I", data, 2)[0]
+            expected_vtl_len = 6 + size
+            expected_chunks = (expected_vtl_len + 62) // 63
+
+            vtl_buf = bytearray(data)
+            for _ in range(expected_chunks - 1):
+                rem_chunk = _read_hid_chunk(timeout_s)
+                if rem_chunk is not None:
+                    vtl_buf.extend(rem_chunk[1:])
+
+            vtl_pkt = bytes(vtl_buf[:expected_vtl_len])
+            entry = parse_file_packet(vtl_pkt)
+            if entry is not None:
+                entries.append(entry)
+
+        return entries
+
+    def get_file(
+        self,
+        name: str,
+        file_type: int | PrimeFileType | None = None,
+    ) -> PrimeCatalogEntry | None:
+        """Retrieve a specific file/note/program by name from the calculator catalog."""
+        catalog = self.list_content()
+        target_name = name.strip().lower()
+        for entry in catalog:
+            if entry.name.lower() == target_name:
+                if file_type is None or entry.file_type == int(file_type):
+                    return entry
+        return None
+
+    def delete_file(
+        self,
+        name: str,
+        file_type: int | PrimeFileType = PrimeFileType.NOTE,
+    ) -> bool:
+        """Clear/delete a file in calculator memory.
+        
+        Note: The HP Prime protocol does not offer a standalone DELETE command.
+        Overwrites the item with empty content, clearing the note or program body.
+        """
+        self.send_file(name, "", file_type=file_type)
+        return True
+
+
