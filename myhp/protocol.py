@@ -34,7 +34,7 @@ class PrimeInfo:
     @classmethod
     def from_bytes(cls, payload: bytes, model_hint: str = "") -> PrimeInfo:
         """Parse the payload returned by CMD_GET_INFOS (0xFA).
-        
+
         The typical 108-byte payload structure:
         - Bytes 0..63: UTF-16LE or ASCII identification string (starts with 'STAR')
         - Bytes 72..74: Build number (uint16 little-endian)
@@ -93,7 +93,7 @@ class PrimeInfo:
 
 def build_command_packet(cmd: int | PrimeCommand, packet_id: int = 0, payload: bytes = b"") -> bytes:
     """Build a 65-byte HID packet for transmission to the HP Prime.
-    
+
     Structure:
     - Byte 0: Report ID (0x00)
     - Byte 1: Packet ID / sequence (0..254)
@@ -113,11 +113,11 @@ def build_command_packet(cmd: int | PrimeCommand, packet_id: int = 0, payload: b
 
 def parse_vtl_response(chunks: list[bytes]) -> tuple[int, bytes]:
     """Parse reassembled response chunks from the calculator into (cmd, payload).
-    
+
     Each 64-byte received HID packet format:
     - Byte 0: Sequence number (0x00, 0x01, ...)
     - Bytes 1..63: Data stream
-    
+
     In the data stream:
     - Stream Byte 0: Command echo (e.g. 0xFA for INFOS)
     - Stream Byte 1: Flag (e.g. 0x01)
@@ -143,8 +143,8 @@ def parse_vtl_response(chunks: list[bytes]) -> tuple[int, bytes]:
 
 
 def chunk_payload(data: bytes, chunk_size: int = 64) -> list[bytes]:
-    """Fragment virtual packet data into 65-byte HID packets for transmission.
-    
+    """Fragment virtual packet data into 65-byte HID packets for transmission (Legacy framing).
+
     Structure of each HID output packet:
     - Byte 0: Report ID (0x00)
     - Byte 1: Sequence / packet ID (0, 1, 2, ... wrapping at 254)
@@ -167,6 +167,49 @@ def chunk_payload(data: bytes, chunk_size: int = 64) -> list[bytes]:
 
         offset = slice_end
         pkt_id = (pkt_id + 1) % 0xFF
+
+    return chunks
+
+
+def chunk_v2_payload(data: bytes, message_id: int = 1, chunk_size: int = 64) -> list[bytes]:
+    """Fragment data into 65-byte HID packets using HP Prime V2 Content Framing.
+
+    Structure:
+    - First report (65 bytes for hidraw):
+      - pkt[0] = 0x00 (hidraw report ID)
+      - pkt[1] = 0x01 (sequence = 1)
+      - pkt[2:6] = struct.pack("<I", message_id) (4 bytes little-endian)
+      - pkt[6:10] = struct.pack("<I", len(data)) (4 bytes little-endian, total data size)
+      - pkt[10:10+take] = data[:take] (take = min(chunk_size - 9, len(data)), up to 55 bytes)
+    - Subsequent reports (65 bytes):
+      - pkt[0] = 0x00 (hidraw report ID)
+      - pkt[1] = sequence (2, 3, 4... wrapping to 2 if exceeding 0xFD)
+      - pkt[2:2+take] = data[offset:offset+take] (take = min(chunk_size - 1, remaining), up to 63 bytes)
+
+    Returns a list of 65-byte report packets.
+    """
+    chunks: list[bytes] = []
+
+    take = min(chunk_size - 9, len(data))
+    pkt = bytearray(chunk_size + 1)
+    pkt[0] = 0x00
+    pkt[1] = 0x01
+    pkt[2:6] = struct.pack("<I", message_id)
+    pkt[6:10] = struct.pack("<I", len(data))
+    pkt[10:10 + take] = data[:take]
+    chunks.append(bytes(pkt))
+
+    offset = take
+    seq = 2
+    while offset < len(data):
+        take = min(chunk_size - 1, len(data) - offset)
+        pkt = bytearray(chunk_size + 1)
+        pkt[0] = 0x00
+        pkt[1] = seq & 0xFF
+        pkt[2:2 + take] = data[offset:offset + take]
+        chunks.append(bytes(pkt))
+        offset += take
+        seq = 2 if seq >= 0xFD else seq + 1
 
     return chunks
 
@@ -205,19 +248,34 @@ class PrimeCatalogEntry:
 
 def parse_file_packet(vtl_pkt: bytes) -> PrimeCatalogEntry | None:
     """Parse a single reassembled virtual file packet (CMD_FILE 0xF7).
-    
+
     Structure:
     - Byte 0: 0xF7
-    - Byte 1: Flag (usually 0x01)
-    - Bytes 2..5: Size (uint32 big-endian) = namelen + content_len + 4
-    - Byte 6: File Type
-    - Byte 7: Namelen (uint8)
-    - Bytes 8..9: CRC16
-    - Bytes 10..10+namelen: Name (UTF-16LE)
-    - Bytes 10+namelen..6+size: Content
+    - Byte 1: Flag (0x01 for single files, 0x03 for compressed composite app objects)
+    - Bytes 2..5: Size (uint32 big-endian)
+    - Bytes 6..end: For 0x01, header + content; for 0x03, uncomp size (LE) + zlib stream
     """
+    import zlib
     if len(vtl_pkt) < 10 or vtl_pkt[0] != 0xF7:
         return None
+
+    cmd_flag = vtl_pkt[1]
+    if cmd_flag == 0x03:
+        try:
+            compressed = vtl_pkt[10:]
+            decomp = zlib.decompress(compressed)
+            file_type = decomp[0]
+            namelen = decomp[1]
+            name = decomp[4 : 4 + namelen].decode("utf-16le", errors="replace").rstrip("\x00")
+            raw_content = decomp[4 + namelen :]
+            return PrimeCatalogEntry(
+                file_type=file_type,
+                name=name,
+                size=len(raw_content),
+                raw_content=raw_content,
+            )
+        except Exception:
+            return None
 
     size = struct.unpack_from(">I", vtl_pkt, 2)[0]
     file_type = vtl_pkt[6]

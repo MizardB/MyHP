@@ -6,11 +6,12 @@ import glob
 import os
 import select
 import struct
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
-from myhp.apps import read_hpprgm_source
+from myhp.apps import build_app_packet, read_hpprgm_source
 from myhp.formats import PrimeFileType, build_file_payload
 from myhp.protocol import (
     PrimeCatalogEntry,
@@ -18,6 +19,7 @@ from myhp.protocol import (
     PrimeInfo,
     build_command_packet,
     chunk_payload,
+    chunk_v2_payload,
     parse_file_packet,
     parse_vtl_response,
 )
@@ -135,7 +137,7 @@ class PrimeDevice:
 
     def send_raw(self, data: bytes) -> int:
         """Send a raw packet to the device.
-        
+
         For Linux hidraw, packets are 65 bytes long (Report ID 0x00 + 64 bytes).
         """
         if self._fd is None:
@@ -201,7 +203,7 @@ class PrimeDevice:
         file_type: int | PrimeFileType = PrimeFileType.PRGM,
     ) -> int:
         """Send a complete file (note, program, etc.) to the HP Prime.
-        
+
         Builds the virtual file packet, splits it into HID chunks, transmits
         each chunk, and verifies the calculator remains ready.
         Returns the number of transmitted HID chunks.
@@ -220,8 +222,135 @@ class PrimeDevice:
 
         return len(chunks)
 
+    def send_v2_message(
+        self,
+        data: bytes,
+        message_id: int = 4,
+        timeout_s: float = 3.0,
+    ) -> int:
+        """Send data using HP Prime V2 framing (CMD_APP 0xF7 0x03, etc.) and handle ACKs.
+
+        Splits data into V2 chunk reports, transmits them to the calculator,
+        and listens for AckFrame (0xFE 0x01) notifications. Responds with host
+        sync ACK if requested, completing when the Prime confirms receipt
+        (final ACK with sequence 0xFF or final sequence).
+        Returns the number of transmitted chunks.
+        """
+        if self._fd is None:
+            raise RuntimeError("Device not open")
+
+        # 1. Negotiate V2 protocol mode with calculator (FF EC + FD MAX_PROT_VER)
+        p_v2 = bytearray(65)
+        p_v2[1] = 0xFF
+        p_v2[2] = 0xEC
+        self.send_raw(bytes(p_v2))
+        time.sleep(0.02)
+
+        p_fd = bytearray(65)
+        p_fd[1] = 0x01
+        p_fd[2:6] = struct.pack("<I", 1)
+        p_fd[6:10] = struct.pack("<I", 7)
+        p_fd[10:17] = bytes([0xFD, 0x01, 0x00, 0x00, 0x00, 0x01, 0x03])
+        self.send_raw(bytes(p_fd))
+        time.sleep(0.02)
+
+        for _ in range(5):
+            r, _, _ = select.select([self._fd], [], [], 0.05)
+            if r:
+                try:
+                    os.read(self._fd, 64)
+                except OSError:
+                    break
+            else:
+                break
+
+        h_ack1 = bytearray(65)
+        h_ack1[1] = 0xFE
+        h_ack1[2] = 0x01
+        h_ack1[3] = 0x01
+        h_ack1[5:9] = struct.pack("<I", 0x37)
+        h_ack1[9:13] = struct.pack("<I", 1)
+        self.send_raw(bytes(h_ack1))
+
+        chunks = chunk_v2_payload(data, message_id=message_id)
+
+        # Transmit all V2 chunks to the device
+        for chunk in chunks:
+            self.send_raw(chunk)
+            # Drain/handle any immediate incoming packets if available without blocking
+            r, _, _ = select.select([self._fd], [], [], 0.0)
+            if r:
+                try:
+                    os.read(self._fd, 64)
+                except OSError:
+                    pass
+
+        # Wait for the calculator's confirmation ACKs (0xFE 0x01)
+        # Expected sequence:
+        # 1. ACK for the final chunk (seq == final_seq and p_mid == message_id)
+        # 2. Final ACK indicating completion (seq == 0xFF and p_mid == message_id)
+        final_seq = chunks[-1][1]
+        chunk_ack_received = False
+        ack_received = False
+
+        while True:
+            r, _, _ = select.select([self._fd], [], [], timeout_s)
+            if not r:
+                break
+
+            try:
+                report = os.read(self._fd, 64)
+            except OSError:
+                break
+
+            if not report:
+                break
+
+            # ACK frame check: report starts with 0xFE, command 0x01
+            if len(report) >= 4 and report[0] == 0xFE and report[1] == 0x01:
+                seq = report[2]
+                p_pos = struct.unpack_from("<I", report, 4)[0] if len(report) >= 8 else len(data) + 9
+                p_mid = struct.unpack_from("<I", report, 8)[0] if len(report) >= 12 else message_id
+
+                # Ignore keepalive or ACK frames where p_mid != message_id
+                if p_mid != message_id:
+                    continue
+
+                if seq == final_seq:
+                    chunk_ack_received = True
+                    continue
+
+                # Sequence 0xFF indicates full transfer and app registration completion
+                if seq == 0xFF:
+                    ack_received = True
+
+                    try:
+                        # Host response ACK (replica of packets 629 and 631 in capture)
+                        host_ack = bytearray(65)
+                        host_ack[0] = 0x00  # Report ID
+                        host_ack[1] = 0xFE  # Byte 254
+                        host_ack[2] = 0x01  # ACK cmd
+                        host_ack[3] = 0xFF  # Final seq
+                        host_ack[4] = 0x00
+                        host_ack[5:9] = struct.pack("<I", 0x37)  # chunk 1 data size (55 bytes)
+                        host_ack[9:13] = struct.pack("<I", 6)
+                        host_ack[17:21] = struct.pack("<I", p_pos)
+                        host_ack[33:37] = struct.pack("<I", p_mid)
+                        host_ack[41:45] = bytes([0xA2, 0x81, 0x00, 0x00])
+                        self.send_raw(bytes(host_ack))
+                        time.sleep(0.01)
+                        self.send_raw(bytes(host_ack))
+                        time.sleep(0.05)
+
+                    except Exception:
+                        pass
+
+                    break
+
+        return len(chunks)
+
     def send_app(self, name: str, app_directory: str) -> int:
-        """Install an app by sending its three catalog objects over CMD_FILE."""
+        """Install an app by sending a compressed container over CMD_APP (0xF7 0x03)."""
         if self._fd is None:
             raise RuntimeError("Device not open")
         report_size = self._output_report_size()
@@ -230,28 +359,8 @@ class PrimeDevice:
                 f"La instalación de apps aún no está implementada para reportes HID de {report_size} bytes"
             )
 
-        folder = Path(app_directory)
-        app_file = (folder / f"{name}.hpapp").read_bytes()
-        note_file = (folder / f"{name}.hpappnote").read_bytes()
-        program_file = (folder / f"{name}.hpappprgm").read_bytes()
-        program_source = read_hpprgm_source(program_file)
-        transfers = (
-            (PrimeFileType.APP, app_file, True),
-            (PrimeFileType.APPNOTE, note_file, True),
-            (PrimeFileType.APPPRGM, program_source.encode("utf-16le"), True),
-        )
-        reports = 0
-        for file_type, content, raw in transfers:
-            packet = build_file_payload(name, content, file_type=file_type, raw_content=raw)
-            chunks = chunk_payload(packet)
-            for chunk in chunks:
-                self.send_raw(chunk)
-            reports += len(chunks)
-            try:
-                self.check_ready()
-            except Exception:
-                pass
-        return reports
+        packet = build_app_packet(name, app_directory)
+        return self.send_v2_message(packet, message_id=4)
 
     def _output_report_size(self) -> int:
         """Read the output report size from this hidraw node's HID descriptor."""
@@ -297,7 +406,7 @@ class PrimeDevice:
 
     def list_content(self, timeout_s: float = 0.5) -> list[PrimeCatalogEntry]:
         """Query memory catalog from the HP Prime using CMD_RECV_BACKUP (0xF9).
-        
+
         Reads all file packets returned by the calculator until the stream ends.
         Handles graceful recovery if the device resets its USB pipe at completion.
         """
@@ -384,7 +493,7 @@ class PrimeDevice:
         file_type: int | PrimeFileType = PrimeFileType.NOTE,
     ) -> bool:
         """Clear/delete a file in calculator memory.
-        
+
         Note: The HP Prime protocol does not offer a standalone DELETE command.
         Overwrites the item with empty content, clearing the note or program body.
         """
