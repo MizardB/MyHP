@@ -16,4 +16,7 @@ dependencies = []
 myhp = "myhp.cli:main"
 
 [tool.setuptools.package-data]
-myhp = ["data/app_templates/*"]
+myhp = [
+    "data/app_templates/*",
+    "data/gallery_templates/*",
+]

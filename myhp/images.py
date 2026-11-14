@@ -104,9 +104,9 @@ def _resize(
     return new_width, new_height, resized
 
 
-def _a1r5g5b5(rgb: tuple[int, int, int]) -> int:
+def _rgb24(rgb: tuple[int, int, int]) -> int:
     r, g, b = rgb
-    return 0x8000 | (r >> 3) << 10 | (g >> 3) << 5 | (b >> 3)
+    return (r << 16) | (g << 8) | b
 
 
 def png_to_ppl(
@@ -116,19 +116,18 @@ def png_to_ppl(
     max_height: int = 120,
     entrypoint: str | None = None,
 ) -> str:
-    """Create a PPL program that draws a PNG into G1, then displays it."""
+    """Create an interactive PPL program that renders and navigates an image with zoom and pan."""
     if not 1 <= max_width <= 320 or not 1 <= max_height <= 240:
         raise ValueError("El tamaño máximo debe estar entre 1×1 y 320×240")
     width, height, pixels = _png_pixels(data)
     width, height, pixels = _resize(width, height, pixels, max_width, max_height)
 
-    # Pack each run as A1R5G5B5 color, count. Runs bound the source size while
-    # preserving the full 16-bit image palette.
+    # Pack runs in true 24-bit RGB (R*65536 + G*256 + B)
     runs: list[str] = []
-    current = _a1r5g5b5(pixels[0])
+    current = _rgb24(pixels[0])
     count = 0
     for rgb in pixels:
-        color = _a1r5g5b5(rgb)
+        color = _rgb24(rgb)
         if color == current and count < 65535:
             count += 1
         else:
@@ -140,21 +139,65 @@ def png_to_ppl(
     name = (entrypoint or program_name).upper()
     source = (
         f"EXPORT {name}()\nBEGIN\n"
-        "  LOCAL C,I,X,Y,J,N;\n"
-        f"  C:={{{','.join(runs)}}};\n"
-        "  I:=1;X:=0;Y:=0;\n"
+        "  LOCAL c_arr,i_idx,x_pos,y_pos,j_cnt,n_cnt;\n"
+        "  LOCAL sc,ox,oy,is_run,key_c,m_arr,m_x,m_y,m_t,last_x,last_y,is_drag,is_dirty,zx,zy,ix,iy,zfac;\n"
+        f"  c_arr:={{{','.join(runs)}}};\n"
+        "  i_idx:=1;x_pos:=0;y_pos:=0;\n"
         f"  DIMGROB_P(G1,{width},{height},0);\n"
-        "  WHILE I<=SIZE(C) DO\n"
-        "    N:=C(I+1);\n"
-        "    FOR J FROM 1 TO N DO\n"
-        "      PIXON_P(G1,X,Y,C(I));\n"
-        "      X:=X+1;\n"
-        f"      IF X=={width} THEN X:=0;Y:=Y+1;END;\n"
+        "  WHILE i_idx<=SIZE(c_arr) DO\n"
+        "    n_cnt:=c_arr(i_idx+1);\n"
+        "    FOR j_cnt FROM 1 TO n_cnt DO\n"
+        "      PIXON_P(G1,x_pos,y_pos,c_arr(i_idx));\n"
+        "      x_pos:=x_pos+1;\n"
+        f"      IF x_pos=={width} THEN x_pos:=0;y_pos:=y_pos+1;END;\n"
         "    END;\n"
-        "    I:=I+2;\n"
+        "    i_idx:=i_idx+2;\n"
         "  END;\n"
-        f"  BLIT_P(G0,{{{x},{y}}},{{{x + width - 1},{y + height - 1}}},G1);\n"
-        "  WAIT(0);\n"
+        f"  sc:=1;ox:={x};oy:={y};is_run:=1;is_drag:=0;is_dirty:=1;\n"
+        "  WHILE is_run==1 DO\n"
+        "    IF is_dirty==1 THEN\n"
+        "      RECT_P(0,0,319,239,0,0);\n"
+        f"      BLIT_P(G0,IP(ox),IP(oy),IP(ox+({width}*sc)-1),IP(oy+({height}*sc)-1),G1,0,0,{width-1},{height-1});\n"
+        "      is_dirty:=0;\n"
+        "    END;\n"
+        "    key_c:=GETKEY;\n"
+        "    IF key_c==4 OR key_c==15 THEN is_run:=0; END;\n"
+        "    IF key_c==2 THEN oy:=oy+20;is_dirty:=1; END;\n"
+        "    IF key_c==12 THEN oy:=oy-20;is_dirty:=1; END;\n"
+        "    IF key_c==7 THEN ox:=ox+20;is_dirty:=1; END;\n"
+        "    IF key_c==8 THEN ox:=ox-20;is_dirty:=1; END;\n"
+        "    IF key_c==50 OR key_c==45 THEN\n"
+        "      IF key_c==50 THEN zfac:=1.25; ELSE zfac:=0.8; END;\n"
+        "      zx:=160;zy:=120;\n"
+        "      ix:=(zx-ox)/sc;iy:=(zy-oy)/sc;\n"
+        "      sc:=sc*zfac;\n"
+        "      IF sc<0.2 THEN sc:=0.2; END;\n"
+        "      IF sc>10 THEN sc:=10; END;\n"
+        "      ox:=zx-ix*sc;oy:=zy-iy*sc;\n"
+        "      is_dirty:=1;\n"
+        "    END;\n"
+        f"    IF key_c==46 OR key_c==30 THEN sc:=1;ox:={x};oy:={y};is_dirty:=1; END;\n"
+        "    m_arr:=MOUSE;\n"
+        "    IF SIZE(m_arr)>=5 THEN\n"
+        "      m_x:=m_arr(1);m_y:=m_arr(2);m_t:=m_arr(5);\n"
+        "      IF m_t==0 THEN last_x:=m_x;last_y:=m_y;is_drag:=1; END;\n"
+        "      IF m_t==1 AND is_drag==1 THEN\n"
+        "        ox:=ox+m_x-last_x;oy:=oy+m_y-last_y;\n"
+        "        last_x:=m_x;last_y:=m_y;\n"
+        "        is_dirty:=1;\n"
+        "      END;\n"
+        "      IF m_t==2 OR m_t==3 THEN is_drag:=0; END;\n"
+        "      IF m_t==4 THEN\n"
+        "        zx:=m_x;zy:=m_y;\n"
+        "        ix:=(zx-ox)/sc;iy:=(zy-oy)/sc;\n"
+        "        sc:=sc*1.5;\n"
+        "        IF sc>10 THEN sc:=10; END;\n"
+        "        ox:=zx-ix*sc;oy:=zy-iy*sc;\n"
+        "        is_dirty:=1;\n"
+        "      END;\n"
+        "    END;\n"
+        "    WAIT(0.01);\n"
+        "  END;\n"
         "END;\n"
     )
     if len(source.encode("utf-16le")) > 60_000:

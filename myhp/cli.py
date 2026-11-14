@@ -5,9 +5,11 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+import tempfile
+import time
 from pathlib import Path
 
-from myhp.apps import build_app_directory
+from myhp.apps import build_app_directory, build_app_packet, build_gallery_app_directory
 from myhp.formats import PrimeFileType, sanitize_note_name, sanitize_program_name
 from myhp.images import png_icon, png_to_ppl
 from myhp.usb import PrimeDevice, find_prime_devices
@@ -108,6 +110,8 @@ def cmd_send_image(args: argparse.Namespace) -> int:
     if not file_path.is_file():
         print(f"Error: No existe el archivo '{args.file}'.", file=sys.stderr)
         return 1
+
+    temp_dir_obj: tempfile.TemporaryDirectory | None = None
     try:
         image_data = file_path.read_bytes()
         requested_name = args.name if args.name else file_path.stem
@@ -115,37 +119,62 @@ def cmd_send_image(args: argparse.Namespace) -> int:
         if args.app:
             content = png_to_ppl(image_data, safe_name, args.width, args.height, entrypoint="START")
             icon = png_icon(image_data)
-            output_dir = Path(args.output) if args.output else file_path.parent
-            app_directory = build_app_directory(safe_name, content, icon, output_dir)
+            if args.output:
+                output_dir = Path(args.output)
+            else:
+                temp_dir_obj = tempfile.TemporaryDirectory()
+                output_dir = Path(temp_dir_obj.name)
+            app_directory = build_app_directory(safe_name, content, icon, output_dir=output_dir)
         else:
             content = png_to_ppl(image_data, safe_name, args.width, args.height)
     except (OSError, ValueError) as e:
+        if temp_dir_obj is not None:
+            temp_dir_obj.cleanup()
         print(f"Error al convertir la imagen: {e}", file=sys.stderr)
         return 1
 
     prime = _get_target_device(args.device)
     if not prime:
+        if temp_dir_obj is not None:
+            temp_dir_obj.cleanup()
         return 1
     try:
         with prime:
             if args.app:
                 chunks = prime.send_app(safe_name, str(app_directory))
-                installed = any(
-                    item.file_type == PrimeFileType.APP and item.name.lstrip("&").lower() == safe_name.lower()
-                    for item in prime.list_content()
-                )
+                # The HP Prime re-indexes and may re-enumerate its USB interface.
+                # Explicitly close the previous descriptor so a clean session can be established.
+                prime.close()
+                installed = False
+                for _ in range(12):
+                    time.sleep(1.0)
+                    devs = find_prime_devices()
+                    if not devs:
+                        continue
+                    try:
+                        with PrimeDevice(devs[0].hidraw_path) as chk:
+                            if any(
+                                item.file_type == PrimeFileType.APP and item.name.lstrip("&").lower() == safe_name.lower()
+                                for item in chk.list_content()
+                            ):
+                                installed = True
+                                break
+                    except Exception:
+                        pass
                 if not installed:
                     print(
                         f"El paquete de '{safe_name}' se transmitió ({chunks} paquetes HID), "
                         "pero no aparece en el catálogo Apps.",
                         file=sys.stderr,
                     )
-                    print(f"Paquete local preparado: {app_directory}", file=sys.stderr)
+                    if args.output:
+                        print(f"Paquete local preparado: {app_directory}", file=sys.stderr)
                     return 3
                 print(f"Aplicación '{safe_name}' instalada desde {file_path.name} en "
                       f"{prime.hidraw_path} ({chunks} paquetes HID).")
                 print(f"En la calculadora: abre Apps y selecciona {safe_name}.")
-                print(f"Paquete local: {app_directory}")
+                if args.output:
+                    print(f"Paquete local: {app_directory}")
             else:
                 chunks = prime.send_file(safe_name, content, file_type=PrimeFileType.PRGM)
                 print(
@@ -159,8 +188,122 @@ def cmd_send_image(args: argparse.Namespace) -> int:
     except Exception as e:
         print(f"Error al enviar el visor de imagen: {e}", file=sys.stderr)
         return 3
+    finally:
+        if temp_dir_obj is not None:
+            temp_dir_obj.cleanup()
     return 0
 
+
+def cmd_send_gallery(args: argparse.Namespace) -> int:
+    """Build and send a native HP Prime Gallery application with one or more images."""
+    safe_name = sanitize_program_name(args.name).upper()
+    icon_bytes: bytes | None = None
+    if getattr(args, "icon", None):
+        icon_path = Path(args.icon)
+        if not icon_path.is_file():
+            print(f"Error: No existe el archivo de icono '{args.icon}'.", file=sys.stderr)
+            return 1
+        icon_bytes = icon_path.read_bytes()
+
+    has_output = bool(getattr(args, "output", None))
+    temp_dir_obj: tempfile.TemporaryDirectory | None = None
+    if has_output:
+        output_dir = Path(args.output)
+    else:
+        temp_dir_obj = tempfile.TemporaryDirectory()
+        output_dir = Path(temp_dir_obj.name)
+
+    try:
+        app_directory = build_gallery_app_directory(
+            safe_name,
+            args.images,
+            icon=icon_bytes,
+            output_dir=output_dir,
+        )
+    except Exception as e:
+        if temp_dir_obj is not None:
+            temp_dir_obj.cleanup()
+        print(f"Error al construir la aplicación de galería: {e}", file=sys.stderr)
+        return 1
+
+    # Count images in the app folder
+    valid_exts = {".png", ".jpg", ".jpeg", ".bmp"}
+    img_files = [f for f in app_directory.iterdir() if f.is_file() and f.suffix.lower() in valid_exts and f.name != "icon.png"]
+    img_count = len(img_files)
+
+    # Compute total packed size
+    try:
+        packet = build_app_packet(safe_name, app_directory)
+        packed_size = len(packet)
+    except Exception as e:
+        if temp_dir_obj is not None:
+            temp_dir_obj.cleanup()
+        print(f"Error al empaquetar la aplicación: {e}", file=sys.stderr)
+        return 1
+
+    # Check connection / device
+    devs = find_prime_devices()
+    has_target = bool(getattr(args, "device", None))
+    if not has_target and not devs and has_output:
+        print(f"Aplicación de galería '{safe_name}' creada localmente en {app_directory}.")
+        print(f"Imágenes añadidas: {img_count}")
+        print(f"Tamaño empaquetado: {packed_size} bytes")
+        return 0
+
+    prime = _get_target_device(getattr(args, "device", None))
+    if not prime:
+        if temp_dir_obj is not None:
+            temp_dir_obj.cleanup()
+        return 1
+
+    try:
+        with prime:
+            chunks = prime.send_app(safe_name, str(app_directory))
+            # The HP Prime re-indexes and may re-enumerate its USB interface.
+            # Explicitly close the previous descriptor so a clean session can be established.
+            prime.close()
+            installed = False
+            for _ in range(12):
+                time.sleep(1.0)
+                devs = find_prime_devices()
+                if not devs:
+                    continue
+                try:
+                    with PrimeDevice(devs[0].hidraw_path) as chk:
+                        if any(
+                            item.file_type == PrimeFileType.APP and item.name.lstrip("&").lower() == safe_name.lower()
+                            for item in chk.list_content()
+                        ):
+                            installed = True
+                            break
+                except Exception:
+                    pass
+            if not installed:
+                print(
+                    f"El paquete de '{safe_name}' se transmitió ({chunks} paquetes HID), "
+                    "pero no aparece en el catálogo Apps.",
+                    file=sys.stderr,
+                )
+                if has_output:
+                    print(f"Paquete local preparado: {app_directory}", file=sys.stderr)
+                return 3
+            print(f"Galería '{safe_name}' instalada con éxito en {prime.hidraw_path} ({chunks} paquetes HID).")
+            print(f"Imágenes añadidas: {img_count}")
+            print(f"Tamaño empaquetado: {packed_size} bytes")
+            print(f"En la calculadora: abre Apps y selecciona {safe_name}.")
+            if has_output:
+                print(f"Paquete local: {app_directory}")
+    except PermissionError:
+        print(f"Error: Permiso denegado al abrir {prime.hidraw_path}.", file=sys.stderr)
+        return 2
+    except Exception as e:
+        print(f"Error al enviar la aplicación de galería: {e}", file=sys.stderr)
+        return 3
+    finally:
+        if temp_dir_obj is not None:
+            temp_dir_obj.cleanup()
+
+    return 0
 
 
 def cmd_list(args: argparse.Namespace) -> int:
@@ -355,6 +498,21 @@ def main(argv: list[str] | None = None) -> int:
     image_parser.add_argument("--app", action="store_true", help="Instala el visor como aplicación en Apps")
     image_parser.add_argument("--output", help="Carpeta donde guardar el paquete .hpappdir (opcional)")
     image_parser.set_defaults(func=cmd_send_image)
+
+    # Command: send gallery (Native Gallery application)
+    gallery_parser = send_subparsers.add_parser(
+        "gallery",
+        help="Crea y envía una aplicación de Galería nativa con una o varias imágenes (PNG/JPG/BMP)",
+    )
+    gallery_parser.add_argument("name", help="Nombre de la aplicación de galería en la calculadora")
+    gallery_parser.add_argument(
+        "images",
+        nargs="+",
+        help="Uno o más archivos o directorios de imágenes (.png, .jpg, .jpeg, .bmp)",
+    )
+    gallery_parser.add_argument("--icon", help="Ruta a un archivo PNG opcional para el icono de la app", default=None)
+    gallery_parser.add_argument("--output", help="Carpeta donde guardar el paquete .hpappdir generado (opcional)", default=None)
+    gallery_parser.set_defaults(func=cmd_send_gallery)
 
     # Command: list
     list_parser = subparsers.add_parser("list", help="Lista objetos almacenados en la memoria de la calculadora")
