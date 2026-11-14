@@ -10,6 +10,7 @@
 [![Hardware](https://img.shields.io/badge/calculator-HP%20Prime%20G1%20%7C%20G2-0096D6?style=flat-square)](#)
 [![Protocol](https://img.shields.io/badge/protocol-USB%20HID%20V1%20%2F%20V2-314360?style=flat-square)](#)
 [![Python](https://img.shields.io/badge/python-3.9%2B-3776AB?style=flat-square&logo=python&logoColor=white)](#)
+[![License](https://img.shields.io/badge/license-GPLv3-blue?style=flat-square)](LICENSE)
 
 </div>
 
@@ -127,3 +128,10 @@ myhp send image grafico.png -n GRAFICO
 myhp send image grafico.png -n GRAFICO --width 240 --height 180
 myhp send image grafico.png -n GRAFICO --app --output ./build
 ```
+
+---
+
+## 📄 Licencia y Créditos
+
+- Distribuido bajo licencia **GPL-3.0** (ver [`LICENSE`](LICENSE)). El software se proporciona *"tal cual" (as-is)*, sin garantías de ningún tipo.
+- Crédito especial a **Manuel Andrés Vélez** por la plantilla base de visualización *Gallery v2.4.0* para HP Prime y a los proyectos de referencia de protocolo USB HID de la comunidad HP Prime.

@@ -175,11 +175,22 @@ class TestPrimeFormats(unittest.TestCase):
         self.assertEqual(huge_chunks[0xFD][1], 2)  # Wrapped to 2
 
     def test_build_app_packet(self):
-        folder = Path("data/IMAGEN.hpappdir")
-        if not folder.is_dir():
-            self.skipTest("data/IMAGEN.hpappdir no disponible")
+        import tempfile
+        from myhp.apps import build_app_directory
 
-        pkt = build_app_packet("IMAGEN", folder)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            folder = build_app_directory(
+                "IMAGEN",
+                "EXPORT START()\nBEGIN\nEND;\n",
+                b"\x89PNG\r\n\x1a\n",
+                output_dir=tmpdir,
+            )
+            pkt = build_app_packet("IMAGEN", folder)
+            desc_expected = (folder / "IMAGEN.hpapp").read_bytes()
+            note_expected = (folder / "IMAGEN.hpappnote").read_bytes()
+            prgm_expected = (read_hpprgm_source((folder / "IMAGEN.hpappprgm").read_bytes()) + "\0").encode("utf-16le")
+            icon_expected = "icon.png".encode("utf-16le") + b"\0\0" + (folder / "icon.png").read_bytes()
+
         self.assertEqual(pkt[:2], b"\xF7\x03")
 
         comp_len_plus_4 = struct.unpack_from(">I", pkt, 2)[0]
@@ -206,28 +217,26 @@ class TestPrimeFormats(unittest.TestCase):
         curr += 4
         desc = decomp[curr : curr + desc_len]
         curr += desc_len
-        self.assertEqual(desc, (folder / "IMAGEN.hpapp").read_bytes())
+        self.assertEqual(desc, desc_expected)
 
         note_len = struct.unpack_from(">I", decomp, curr)[0]
         curr += 4
         note = decomp[curr : curr + note_len]
         curr += note_len
-        self.assertEqual(note, (folder / "IMAGEN.hpappnote").read_bytes())
+        self.assertEqual(note, note_expected)
 
         prgm_len = struct.unpack_from(">I", decomp, curr)[0]
         curr += 4
         prgm_bytes = decomp[curr : curr + prgm_len]
         curr += prgm_len
-        expected_src = (read_hpprgm_source((folder / "IMAGEN.hpappprgm").read_bytes()) + "\0").encode("utf-16le")
-        self.assertEqual(prgm_bytes, expected_src)
+        self.assertEqual(prgm_bytes, prgm_expected)
 
         # Additional files (icon.png)
         self.assertLess(curr, len(decomp))
         icon_item_len = struct.unpack_from(">I", decomp, curr)[0]
         curr += 4
         icon_item = decomp[curr : curr + icon_item_len]
-        expected_icon = "icon.png".encode("utf-16le") + b"\0\0" + (folder / "icon.png").read_bytes()
-        self.assertEqual(icon_item, expected_icon)
+        self.assertEqual(icon_item, icon_expected)
         curr += icon_item_len
         self.assertEqual(curr, len(decomp))
 
